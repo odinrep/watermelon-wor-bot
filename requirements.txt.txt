@@ -1,7 +1,0 @@
-pyTelegramBotAPI
-yfinance
-apscheduler
-matplotlib
-pandas
-numpy
-python-dateutil
