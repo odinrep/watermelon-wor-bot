@@ -14,12 +14,17 @@ env/
 .idea/
 .DS_Store
 
-# Local data & secrets
+# Local data and secrets
 .env
+*.csv
+*.json
+
+# Archives and experiments
+archive/
+__pycache__/
+*.bak
+*.backup
 *.log
-journal_snaps/
-wor_journal.csv
-wor_state*.json
 
 # Misc
 *.png
