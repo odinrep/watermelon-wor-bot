@@ -1,4 +1,26 @@
+﻿# Python
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.venv/
+venv/
+ENV/
+env/
+
+# Editors/OS
+.vscode/
+.idea/
+.DS_Store
+
+# Local data & secrets
 .env
-wor_state.json
+*.log
+journal_snaps/
+wor_journal.csv
+wor_state*.json
+
+# Misc
+*.png
+*.jpg
