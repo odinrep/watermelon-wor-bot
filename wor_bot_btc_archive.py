@@ -44,75 +44,172 @@ def _mask(t: str) -> str:
         return "<EMPTY>"
     return f"{t[:6]}...{t[-6:]} (len={len(t)})"
 
-# Time-Based Indicator
-from datetime import date, datetime
+# === Cycle definitions & formatter ==========================================
+from datetime import date, datetime, timedelta
 
-CYCLES = [
-    {
-        "name": "2016-2020",
+# Label cycles by their *halving year*
+CYCLE_DEFS = {
+    2012: {
+        "label": "2012-2016",
+        "halving": date(2012, 11, 28),
+        "peak": date(2013, 11, 30),     # major cycle peak (Nov 2013)
+        "bottom": date(2015, 1, 14),    # cycle bottom (Jan 2015)
+        "next_halving": date(2016, 7, 9),
+        "next_peak": date(2017, 12, 17),
+        "next_bottom": date(2018, 12, 15),
+        "projected": False,
+    },
+    2016: {
+        "label": "2016-2020",
         "halving": date(2016, 7, 9),
-        "peak": date(2017, 12, 16),
+        "peak": date(2017, 12, 17),
         "bottom": date(2018, 12, 15),
         "next_halving": date(2020, 5, 11),
+        "next_peak": date(2021, 11, 10),
+        "next_bottom": date(2022, 11, 21),
+        "projected": False,
     },
-    {
-        "name": "2020-2024",
+    2020: {
+        "label": "2020-2024",
         "halving": date(2020, 5, 11),
-        "peak": date(2021, 11, 9),
+        "peak": date(2021, 11, 10),
         "bottom": date(2022, 11, 21),
-        "next_halving": date(2024, 4, 19),
-        "local_bottom": date(2022, 6, 18),  # NEW: local bottom after 2021 peak
+        "next_halving": date(2024, 4, 19),  # use your 19-Apr-2024 anchor
+        "next_peak": None,                  # next cycle handled by 2024 block
+        "next_bottom": None,
+        "projected": False,
     },
-    {
-        "name": "2024-2028",
+    2024: {
+        "label": "2024-2028",
         "halving": date(2024, 4, 19),
-        "peak": date(2025, 10, 7),
-        "bottom": date(2026, 10, 8),   # projected
-        "next_halving": date(2028, 4, 14),
+        "peak": date(2025, 10, 7),   # your projected cycle top
+        "bottom": date(2026, 10, 8), # your projected cycle bottom
+        "next_halving": date(2028, 4, 14),  # your projected next halving
+        "next_peak": None,   # we derive from pnp_days
+        "next_bottom": None, # derive from bnb_days
+
+        # These keep your original projection maths:
+        "pnp_days": 1445,  # Peak → Next Peak
+        "bnb_days": 1445,  # Bottom → Next Bottom
+        "bnp_days": 1079,  # Bottom → Next Peak
+
+        "projected": True,  # mark that peak/bottom/next-halving/next-X are projections
     },
-    {
-        "name": "2028-2032",
-        "halving": date(2028, 4, 14),
-        "peak": date(2029, 9, 21),     # projected
-        "bottom": date(2030, 9, 22),   # projected
-        "next_halving": date(2032, 4, 9),
-    },
-]
+}
 
-def days(a, b):
-    return (b - a).days
+ACTIVE_CYCLE_YEAR = 2024  # used for countdowns
 
-def describe_cycle(idx, today=None, with_time_left: bool = True):
+def _fmt_cycle_date(d: date | None) -> str:
+    return d.strftime("%d-%b-%Y") if d else "n/a"
+
+
+def build_cycle_message(cycle_year: int, today: date | None = None) -> str:
     """
-    Describe one halving cycle.
-
-    - Marks future anchors as '(projected)'.
-    - Optional 'Time Left' section (only for current cycle).
+    Build the /cycle text for a given halving year.
+    For past cycles: just show dates + durations.
+    For the active 2024 cycle: also append a countdown block.
     """
-    today = today or date.today()
-    c = CYCLES[idx]
-    nxt = CYCLES[idx + 1] if idx + 1 < len(CYCLES) else None
+    if today is None:
+        today = datetime.utcnow().date()
 
-    # --- Durations within / across cycles ---
-    halving_to_halving = days(c["halving"], c["next_halving"])
-    peak_to_bottom = days(c["peak"], c["bottom"])
-    bottom_to_halving = days(c["bottom"], c["next_halving"])
+    if cycle_year not in CYCLE_DEFS:
+        raise KeyError(f"Unknown cycle year {cycle_year}")
 
-    if nxt:
-        peak_to_peak = days(c["peak"], nxt["peak"])
-        bottom_to_bottom = days(c["bottom"], nxt["bottom"])
-        bottom_to_next_peak = days(c["bottom"], nxt["peak"])
-    else:
-        peak_to_peak = bottom_to_bottom = bottom_to_next_peak = None
+    cfg = CYCLE_DEFS[cycle_year]
+    h = cfg["halving"]
+    p = cfg.get("peak")
+    b = cfg.get("bottom")
+    nh = cfg.get("next_halving")
+    np = cfg.get("next_peak")
+    nb = cfg.get("next_bottom")
 
-    def fmt_anchor(d: date) -> str:
-        """
-        Show '(projected)' for future anchors
-        so it's clear – e.g. bottoms that
-        haven't actually happened yet.
-        """
-        suffix = " (projected)" if d > today else ""
-        return f"{d:%d-%b-%Y}{suffix}"
+    # Derive projected next peak/bottom from offsets if not explicitly stored
+    if np is None and p and cfg.get("pnp_days") is not None:
+        np = p + timedelta(days=cfg["pnp_days"])
+    if nb is None and b and cfg.get("bnb_days") is not None:
+        nb = b + timedelta(days=cfg["bnb_days"])
+
+    def days(a: date | None, b: date | None, fallback_key: str | None = None):
+        if a and b:
+            return (b - a).days
+        if fallback_key and cfg.get(fallback_key) is not None:
+            return cfg[fallback_key]
+        return None
+
+    lines: list[str] = []
+
+    # Header block
+    lines.append(f"📆 Cycle {cfg['label']}")
+    lines.append(f"- Halving: {_fmt_cycle_date(h)}")
+    if p:
+        lines.append(
+            f"- Peak:    {_fmt_cycle_date(p)}"
+            + (" (projected)" if cfg["projected"] and cycle_year == ACTIVE_CYCLE_YEAR else "")
+        )
+    if b:
+        lines.append(
+            f"- Bottom:  {_fmt_cycle_date(b)}"
+            + (" (projected)" if cfg["projected"] and cycle_year == ACTIVE_CYCLE_YEAR else "")
+        )
+    if nh:
+        lines.append(
+            f"- Next Halving: {_fmt_cycle_date(nh)}"
+            + (" (projected)" if cfg["projected"] and cycle_year == ACTIVE_CYCLE_YEAR else "")
+        )
+    if np:
+        lines.append(
+            f"- Next Peak:    {_fmt_cycle_date(np)}"
+            + (" (projected)" if cfg["projected"] and cycle_year == ACTIVE_CYCLE_YEAR else "")
+        )
+    if nb:
+        lines.append(
+            f"- Next Bottom:  {_fmt_cycle_date(nb)}"
+            + (" (projected)" if cfg["projected"] and cycle_year == ACTIVE_CYCLE_YEAR else "")
+        )
+
+    # Duration block
+    lines.append("")
+    lines.append("⏱ Durations:")
+    dd = days(h, nh)
+    if dd is not None:
+        lines.append(f"- Halving → Halving: {dd:5d} days")
+    dd = days(p, b)
+    if dd is not None:
+        lines.append(f"- Peak → Bottom:     {dd:5d} days")
+    dd = days(b, nh)
+    if dd is not None:
+        lines.append(f"- Bottom → Halving:  {dd:5d} days")
+    dd = days(p, np, "pnp_days")
+    if dd is not None:
+        lines.append(f"- Peak → Next Peak:      {dd:5d} days")
+    dd = days(b, nb, "bnb_days")
+    if dd is not None:
+        lines.append(f"- Bottom → Next Bottom:  {dd:5d} days")
+    dd = days(b, np, "bnp_days")
+    if dd is not None:
+        lines.append(f"- Bottom → Next Peak:    {dd:5d} days")
+
+    # Countdown only for the active (2024) cycle
+    if cycle_year == ACTIVE_CYCLE_YEAR:
+        lines.append("")
+        lines.append(f"⌛ Time Left (from {today:%d-%b-%Y}):")
+
+        def left(label: str, target: date | None):
+            if not target:
+                return
+            delta = (target - today).days
+            if delta >= 0:
+                lines.append(f"- To {label}: {delta:4d} days")
+            else:
+                lines.append(f"- Since {label}: {-delta:4d} days")
+
+        # Local-bottom countdown stays handled by your separate send_cycle_countdown()
+        left("Bottom", b)
+        left("Halving", nh)
+        left("Peak", np)
+
+    return "\n".join(lines)
+
 
     # --- Header & anchors ---
     lines = []
@@ -1231,70 +1328,38 @@ def sheets_router(m):
         return
 
 @bot.message_handler(commands=['cycle'])
+@bot.message_handler(commands=['cycle'])
 def handle_cycle(message):
     """
-    /cycle           -> current cycle (by today's date)
-    /cycle 2016      -> show 2016–2020 cycle
-    /cycle 2020      -> show 2020–2024 cycle
-    /cycle 2024      -> show 2024–2028 cycle
-    /cycle 2028      -> show 2028–2032 cycle
-
-    Only the *current* cycle shows the 'Time Left' section.
-    All outputs push to TBI topic if configured.
+    Usage:
+      /cycle          -> active cycle (2024-2028)
+      /cycle 2020     -> 2020-2024 cycle
+      /cycle 2016     -> 2016-2020 cycle
+      /cycle 2012     -> 2012-2016 cycle
     """
-    text = (message.text or "").strip()
-    parts = text.split()
-    arg = parts[1].strip() if len(parts) > 1 else None
+    parts = message.text.split()
+    year = ACTIVE_CYCLE_YEAR
 
-    today = date.today()
-
-    # Map from "anchor year" → cycle index in CYCLES
-    year_to_idx = {
-        "2016": 0,
-        "2020": 1,
-        "2024": 2,
-        "2028": 3,
-    }
-
-    # --- Determine which cycle is "current" based on today ---
-    current_idx = None
-    for i, c in enumerate(CYCLES):
-        # Treat each cycle as [halving, next_halving)
-        if c["halving"] <= today < c["next_halving"]:
-            current_idx = i
-            break
-    if current_idx is None:
-        # If we're past all known next_halving dates, just use the last cycle
-        current_idx = len(CYCLES) - 1
-
-    # --- Determine which cycle to display ---
-    if arg and arg in year_to_idx:
-        idx = year_to_idx[arg]
-    else:
-        # no / invalid arg → default to current cycle
-        idx = current_idx
-
-    # Show 'time left' only for the current cycle
-    with_time = (idx == current_idx)
-
-    try:
-        reply_text = describe_cycle(idx, today=today, with_time_left=with_time)
-    except Exception as e:
-        reply_text = f"/cycle error: {e}"
-
-    # --- Prefer sending to TBI topic ---
-    if GROUP_ID and TBI_TOPIC_ID:
+    if len(parts) >= 2:
         try:
-            bot.send_message(
-                GROUP_ID,
-                reply_text,
-                message_thread_id=TBI_TOPIC_ID
-            )
-        except Exception as e:
-            print("cycle → TBI_TOPIC_ID error:", e)
-            bot.reply_to(message, reply_text, **reply_kwargs_for(message))
-    else:
-        bot.reply_to(message, reply_text, **reply_kwargs_for(message))
+            year = int(parts[1])
+        except ValueError:
+            # if user types junk like '/cycle abc', just fall back
+            year = ACTIVE_CYCLE_YEAR
+
+    if year not in CYCLE_DEFS:
+        available = ", ".join(str(y) for y in sorted(CYCLE_DEFS))
+        bot.reply_to(
+            message,
+            f"Unknown cycle year *{year}*.\n"
+            f"Available cycles: {available}",
+            parse_mode="Markdown",
+        )
+        return
+
+    text = build_cycle_message(year)
+    bot.reply_to(message, text)
+
 
 @bot.message_handler(commands=['countdown'])
 def handle_countdown(message):
