@@ -1,1 +1,1 @@
-worker: python wor_bot_btc_only_group.py
+worker: python wor_bot_btc_archive.py
