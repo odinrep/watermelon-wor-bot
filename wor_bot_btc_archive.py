@@ -15,6 +15,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 from matplotlib.patches import Rectangle
+from matplotlib.offsetbox import AnchoredText
 
 import ccxt
 import telebot
@@ -42,6 +43,185 @@ def _mask(t: str) -> str:
     if not t:
         return "<EMPTY>"
     return f"{t[:6]}...{t[-6:]} (len={len(t)})"
+
+# Time-Based Indicator
+from datetime import date, datetime
+
+CYCLES = [
+    {
+        "name": "2016-2020",
+        "halving": date(2016, 7, 9),
+        "peak": date(2017, 12, 16),
+        "bottom": date(2018, 12, 15),
+        "next_halving": date(2020, 5, 11),
+    },
+    {
+        "name": "2020-2024",
+        "halving": date(2020, 5, 11),
+        "peak": date(2021, 11, 9),
+        "bottom": date(2022, 11, 21),
+        "next_halving": date(2024, 4, 19),
+        "local_bottom": date(2022, 6, 18),  # NEW: local bottom after 2021 peak
+    },
+    {
+        "name": "2024-2028",
+        "halving": date(2024, 4, 19),
+        "peak": date(2025, 10, 7),
+        "bottom": date(2026, 10, 8),   # projected
+        "next_halving": date(2028, 4, 14),
+    },
+    {
+        "name": "2028-2032",
+        "halving": date(2028, 4, 14),
+        "peak": date(2029, 9, 21),     # projected
+        "bottom": date(2030, 9, 22),   # projected
+        "next_halving": date(2032, 4, 9),
+    },
+]
+
+def days(a, b):
+    return (b - a).days
+
+def describe_cycle(idx, today=None, with_time_left: bool = True):
+    """
+    Describe one halving cycle.
+
+    - Marks future anchors as '(projected)'.
+    - Optional 'Time Left' section (only for current cycle).
+    """
+    today = today or date.today()
+    c = CYCLES[idx]
+    nxt = CYCLES[idx + 1] if idx + 1 < len(CYCLES) else None
+
+    # --- Durations within / across cycles ---
+    halving_to_halving = days(c["halving"], c["next_halving"])
+    peak_to_bottom = days(c["peak"], c["bottom"])
+    bottom_to_halving = days(c["bottom"], c["next_halving"])
+
+    if nxt:
+        peak_to_peak = days(c["peak"], nxt["peak"])
+        bottom_to_bottom = days(c["bottom"], nxt["bottom"])
+        bottom_to_next_peak = days(c["bottom"], nxt["peak"])
+    else:
+        peak_to_peak = bottom_to_bottom = bottom_to_next_peak = None
+
+    def fmt_anchor(d: date) -> str:
+        """
+        Show '(projected)' for future anchors
+        so it's clear – e.g. bottoms that
+        haven't actually happened yet.
+        """
+        suffix = " (projected)" if d > today else ""
+        return f"{d:%d-%b-%Y}{suffix}"
+
+    # --- Header & anchors ---
+    lines = []
+    lines.append(f"📆 Cycle {c['name']}")
+    lines.append(f"- Halving: {fmt_anchor(c['halving'])}")
+    lines.append(f"- Peak:    {fmt_anchor(c['peak'])}")
+    lines.append(f"- Bottom:  {fmt_anchor(c['bottom'])}")
+    lines.append(f"- Next Halving: {fmt_anchor(c['next_halving'])}")
+    lines.append("")
+    lines.append("⏱ Durations:")
+    lines.append(f"- Halving → Halving: {halving_to_halving} days")
+    lines.append(f"- Peak → Bottom:     {peak_to_bottom} days")
+    lines.append(f"- Bottom → Halving:  {bottom_to_halving} days")
+    if nxt:
+        lines.append(f"- Peak → Next Peak:      {peak_to_peak} days")
+        lines.append(f"- Bottom → Next Bottom:  {bottom_to_bottom} days")
+        lines.append(f"- Bottom → Next Peak:    {bottom_to_next_peak} days")
+
+    # --- Optional time-left block (only for current cycle) ---
+    if with_time_left:
+        time_to_bottom = days(today, c["bottom"])
+        time_to_halving = days(today, c["next_halving"])
+        time_to_peak = days(today, nxt["peak"]) if nxt else None
+
+        lines.append("")
+        lines.append(f"⌛ Time Left (from {today:%d-%b-%Y}):")
+        lines.append(f"- To Bottom:  {time_to_bottom} days")
+        lines.append(f"- To Halving: {time_to_halving} days")
+        if time_to_peak is not None:
+            lines.append(f"- To Peak:    {time_to_peak} days")
+
+    return "\n".join(lines)
+
+def get_current_cycle_idx(today: date | None = None) -> int:
+    """
+    Return the index in CYCLES for the cycle that 'today' sits in.
+    If we're past all known next_halving dates, return the last cycle.
+    """
+    today = today or date.today()
+    current_idx = len(CYCLES) - 1
+    for i, c in enumerate(CYCLES):
+        if c["halving"] <= today < c["next_halving"]:
+            current_idx = i
+            break
+    return current_idx
+
+def get_local_bottom_for_cycle(idx: int):
+    """
+    For historical cycles: return explicit local_bottom if present.
+    For future cycles: project using the previous cycle's
+    (peak -> local_bottom) lag.
+    """
+    c = CYCLES[idx]
+
+    # If this cycle explicitly has a local_bottom, just use it
+    if "local_bottom" in c:
+        return c["local_bottom"]
+
+    # Otherwise, try to project from previous cycle
+    prev_idx = idx - 1
+    if prev_idx >= 0:
+        prev = CYCLES[prev_idx]
+        if "local_bottom" in prev:
+            lag_days = days(prev["peak"], prev["local_bottom"])
+            # project: current peak + lag
+            from datetime import timedelta
+            return c["peak"] + timedelta(days=lag_days)
+
+    return None
+
+def build_cycle_countdown_text(today: date | None = None) -> str:
+    """
+    Clean, aligned, Telegram-safe countdown block.
+    """
+    today = today or date.today()
+    idx = get_current_cycle_idx(today)
+    c = CYCLES[idx]
+    nxt = CYCLES[idx + 1] if idx + 1 < len(CYCLES) else None
+
+    def clamp(n: int) -> int:
+        return n if n > 0 else 0
+
+    # values
+    local_bottom = get_local_bottom_for_cycle(idx)
+    to_local = clamp(days(today, local_bottom)) if local_bottom else None
+
+    to_bottom  = clamp(days(today, c["bottom"]))
+    to_halving = clamp(days(today, c["next_halving"]))
+    to_peak    = clamp(days(today, nxt["peak"])) if nxt else None
+
+    # compute width so all days align
+    numbers = [v for v in [to_local, to_bottom, to_halving, to_peak] if v is not None]
+    width = max(len(str(v)) for v in numbers)
+
+    # Build lines (monospaced inside ``` block)
+    lines = []
+    lines.append(f"⌛ Time Left (as of {today:%d-%b-%Y})")
+    lines.append("-----------------------------------------------------------")
+    if to_local is not None:
+        lines.append(f"Local Bottom : {to_local:>{width}} days")
+    lines.append(f"Cycle Bottom : {to_bottom:>{width}} days")
+    lines.append(f"Next Halving : {to_halving:>{width}} days")
+    if to_peak is not None:
+        lines.append(f"Next Peak    : {to_peak:>{width}} days")
+
+    # Wrap in triple backticks WITHOUT indentation
+    return "\n" + "\n".join(lines) + "\n"
+
+
 
 # -------- Google Sheets integration --------
 SHEETS_ID  = os.environ.get("WOR_SHEETS_SPREADSHEET_ID", "").strip()
@@ -179,8 +359,8 @@ if not TELEGRAM_BOT_TOKEN or not TOKEN_RE.match(TELEGRAM_BOT_TOKEN):
 
 GROUP_ID     = int(os.environ.get("WATERMELON_GROUP_ID", "0") or "0")
 WOR_TOPIC_ID = int(os.environ.get("WOR_TOPIC_ID", "0") or "0")
-MOR_TOPIC_ID = int(os.environ.get("MOR_TOPIC_ID", "0") or "0")
-PIE_TOPIC_ID = int(os.environ.get("PIE_TOPIC_ID", "0") or "0")
+WOR_ARCHIVE_TOPIC_ID = int(os.environ.get("WOR_ARCHIVE_TOPIC_ID", "0") or "0")
+TBI_TOPIC_ID = int(os.environ.get("TBI_TOPIC_ID", "0") or "0")
 CHANNEL_ID   = int(os.environ.get("WOR_CHANNEL_ID", "0") or "0")
 
 # Strategy defaults
@@ -269,11 +449,15 @@ def post_to_topic(topic_id: int, *, text=None, photo_bytes=None, document_path=N
         return False
     try:
         if photo_bytes is not None:
+            if isinstance(photo_bytes, (bytes, bytearray)):
+                photo_bytes = io.BytesIO(photo_bytes)
+                photo_bytes.name = "image.png"
             bot.send_photo(GROUP_ID, photo_bytes, caption=text or None, message_thread_id=topic_id)
         elif document_path is not None:
             with open(document_path, "rb") as f:
-                bot.send_document(GROUP_ID, f, visible_file_name=os.path.basename(document_path),
-                                  caption=text or None, message_thread_id=topic_id)
+                bot.send_document(GROUP_ID, f,
+                    visible_file_name=os.path.basename(document_path),
+                    caption=text or None, message_thread_id=topic_id)
         elif text:
             bot.send_message(GROUP_ID, text, message_thread_id=topic_id)
         else:
@@ -283,15 +467,56 @@ def post_to_topic(topic_id: int, *, text=None, photo_bytes=None, document_path=N
         print("post_to_topic error:", e)
         return False
 
+def post_to_tbi(text=None, photo_bytes=None, document_path=None):
+    if not GROUP_ID or not TBI_TOPIC_ID:
+        return False
+    try:
+        if photo_bytes is not None:
+            bot.send_photo(GROUP_ID, photo_bytes, caption=text or None,
+                           message_thread_id=TBI_TOPIC_ID)
+        elif document_path is not None:
+            with open(document_path, "rb") as f:
+                bot.send_document(GROUP_ID, f,
+                    visible_file_name=os.path.basename(document_path),
+                    caption=text or None,
+                    message_thread_id=TBI_TOPIC_ID)
+        elif text:
+            bot.send_message(GROUP_ID, text, message_thread_id=TBI_TOPIC_ID)
+        else:
+            return False
+        return True
+    except Exception as e:
+        print("post_to_tbi error:", e)
+        return False
+
+def send_cycle_countdown():
+    """
+    Daily countdown alert into TBI topic (if configured).
+    Falls back to console print if no group/topic is set.
+    """
+    text = build_cycle_countdown_text()
+    if GROUP_ID and TBI_TOPIC_ID:
+        ok = post_to_tbi(text=text)
+        if not ok:
+            print("[cycle] countdown send failed:", text)
+    else:
+        # No group/topic configured – just log it
+        print("[cycle] countdown:", text)
+
 def post_to_channel(*, text=None, photo_bytes=None, document_path=None):
     if not CHANNEL_ID:
         return False
     try:
         if photo_bytes is not None:
+            if isinstance(photo_bytes, (bytes, bytearray)):
+                photo_bytes = io.BytesIO(photo_bytes)
+                photo_bytes.name = "image.png"
             bot.send_photo(CHANNEL_ID, photo_bytes, caption=text or None)
         elif document_path is not None:
             with open(document_path, "rb") as f:
-                bot.send_document(CHANNEL_ID, f, visible_file_name=os.path.basename(document_path), caption=text or None)
+                bot.send_document(CHANNEL_ID, f,
+                    visible_file_name=os.path.basename(document_path),
+                    caption=text or None)
         elif text:
             bot.send_message(CHANNEL_ID, text)
         else:
@@ -420,12 +645,16 @@ def plot_equity_index(trades):
     buf = io.BytesIO(); plt.tight_layout(); plt.savefig(buf, format="png", dpi=150); plt.close(fig)
     buf.seek(0); return buf
 
-# ============================ DATA & WOR LOGIC ============================
-def fetch_ohlcv(symbol="BTC/USDT", period_days=10, interval="1h"):
-    tf = interval
+# ============================ INDICATORS (Weekly) ============================
+def fetch_weekly(symbol: str = "BTC/USDT", since_days: int = 4000) -> pd.DataFrame:
+    """
+    Weekly OHLCV from Binance via ccxt, using the same fetch pattern as hourly.
+    """
     binance = ccxt.binance({'enableRateLimit': True})
+    tf = "1w"
     now = datetime.now(timezone.utc)
-    since = int((now - timedelta(days=period_days)).timestamp() * 1000)
+    since = int((now - timedelta(days=since_days)).timestamp() * 1000)
+
     ohlcv = []
     limit = 1000
     while True:
@@ -437,8 +666,260 @@ def fetch_ohlcv(symbol="BTC/USDT", period_days=10, interval="1h"):
         if last_ts >= int(now.timestamp() * 1000) - 60_000:
             break
         since = last_ts + 1
+
+    if not ohlcv:
+        return pd.DataFrame(columns=["Open","High","Low","Close","Volume"])
+
+    df = pd.DataFrame(ohlcv, columns=["ts","Open","High","Low","Close","Volume"])
+    df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
+    df = df.set_index("ts").sort_index()
+    return df[["Open","High","Low","Close","Volume"]].astype(float)
+
+
+def compute_weekly_indicators(df_weekly: pd.DataFrame) -> pd.DataFrame:
+    """
+    Adds:
+      - 50-week MA (SMA)
+      - Bull Market Support Band (BMSB): Upper = 20W SMA, Lower = 21W EMA
+    """
+    df = df_weekly.copy()
+    df["MA50"] = df["Close"].rolling(window=50, min_periods=50).mean()
+    df["SMA20"] = df["Close"].rolling(window=20, min_periods=20).mean()
+    df["EMA21"] = df["Close"].ewm(span=21, adjust=False).mean()
+    df["BMSB_upper"] = df["SMA20"]
+    df["BMSB_lower"] = df["EMA21"]
+    return df
+
+
+def latest_weekly_snapshot_text(df: pd.DataFrame) -> str:
+    """
+    Returns a concise multi-line text block with latest indicator values.
+    """
+    dfl = df.dropna(subset=["Close"])
+    if dfl.empty:
+        return "No weekly data."
+    last = dfl.iloc[-1]
+    close = float(last["Close"])
+    ma50  = last.get("MA50")
+    up    = last.get("BMSB_upper")
+    lo    = last.get("BMSB_lower")
+
+    # Position vs band
+    pos = ""
+    if pd.notna(up) and pd.notna(lo):
+        if close > up: pos = "above band"
+        elif close < lo: pos = "below band"
+        else: pos = "within band"
+
+    def fmt(x): 
+        return f"{float(x):,.2f}" if pd.notna(x) else "—"
+
+    lines = [
+        "=== Latest Weekly Snapshot ===",
+        f"Close : {fmt(close)} USDT",
+        f"50W MA (SMA): {fmt(ma50)} USDT",
+        f"BMSB Upper (20W SMA): {fmt(up)} USDT",
+        f"BMSB Lower (21W EMA): {fmt(lo)} USDT",
+        f"Position vs BMSB: {pos or '—'}"
+    ]
+    return "\n".join(lines)
+
+
+def plot_weekly_indicators(df: pd.DataFrame) -> bytes:
+    """
+    Dark chart with Close, 50W MA, and BMSB shaded band.
+    Returns PNG bytes.
+    """
+    plt.style.use("dark_background")
+    fig, ax = plt.subplots(figsize=(12, 6))
+
+    ax.plot(df.index, df["Close"], label="Close", lw=1.6, color="#87e5ff")
+
+    if df["MA50"].notna().any():
+        ax.plot(df.index, df["MA50"], label="50W MA (SMA)", lw=1.2, linestyle="--", color="#ffffff")
+
+    have_band = df["BMSB_upper"].notna().any() and df["BMSB_lower"].notna().any()
+    if have_band:
+        ax.plot(df.index, df["BMSB_upper"], label="BMSB Upper (20W SMA)", lw=1.0, color="#f3b76b")
+        ax.plot(df.index, df["BMSB_lower"], label="BMSB Lower (21W EMA)", lw=1.0, color="#f19b2c")
+        ax.fill_between(df.index, df["BMSB_lower"], df["BMSB_upper"], alpha=0.18, color="#ffa726")
+
+    ax.set_title("BTC/USDT — Weekly 50W MA & Bull Market Support Band", fontsize=13, weight="bold")
+    ax.set_ylabel("Price (USDT)"); ax.set_xlabel("Time (UTC)")
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m-%d"))
+    fig.autofmt_xdate()
+    ax.legend(loc="best", fontsize=9, framealpha=0.25)
+    ax.grid(alpha=0.15)
+
+    buf = io.BytesIO()
+    plt.tight_layout()
+    fig.savefig(buf, format="png", dpi=150)
+    plt.close(fig)
+    buf.seek(0)
+    return buf.getvalue()
+
+def weekly_snapshot_text_at(df_weekly: pd.DataFrame, which: int = -2) -> str:
+    """
+    Return a multi-line text for a specific weekly bar.
+    which = -1 (latest bar, may be incomplete)
+            -2 (previous fully-closed week)  <-- default
+    """
+    dfl = df_weekly.dropna(subset=["Close"])
+    if len(dfl) < abs(which):
+        return "Not enough weekly data."
+
+    row = dfl.iloc[which]
+    week_open = row.name  # index is the bar open time (UTC)
+    week_label = pd.to_datetime(week_open).strftime("%Y-%m-%d")  # Monday open UTC (Binance)
+
+    close = float(row["Close"])
+    ma50  = row.get("MA50")
+    up    = row.get("BMSB_upper")
+    lo    = row.get("BMSB_lower")
+
+    pos = ""
+    if pd.notna(up) and pd.notna(lo):
+        if close > up: pos = "above band"
+        elif close < lo: pos = "below band"
+        else: pos = "within band"
+
+    def fmt(x): return f"{float(x):,.2f}" if pd.notna(x) else "—"
+
+    lines = [
+        f"=== Weekly Snapshot (Week start {week_label} UTC) ===",
+        f"Close : {fmt(close)} USDT",
+        f"50W MA (SMA): {fmt(ma50)} USDT",
+        f"BMSB Upper (20W SMA): {fmt(up)} USDT",
+        f"BMSB Lower (21W EMA): {fmt(lo)} USDT",
+        f"Position vs BMSB: {pos or '—'}",
+    ]
+    return "\n".join(lines)
+
+# ============================ WEEKLY INDICATORS (for overlay) ============================
+
+def _fetch_weekly_full(symbol: str = "BTC/USDT", since_days: int = 4000) -> pd.DataFrame:
+    binance = ccxt.binance({'enableRateLimit': True})
+    tf = "1w"
+    now = datetime.now(timezone.utc)
+    since = int((now - timedelta(days=since_days)).timestamp() * 1000)
+
+    ohlcv, limit = [], 1000
+    while True:
+        batch = binance.fetch_ohlcv(symbol, timeframe=tf, since=since, limit=limit)
+        if not batch:
+            break
+        ohlcv.extend(batch)
+        last_ts = batch[-1][0]
+        if last_ts >= int(now.timestamp() * 1000) - 60_000:
+            break
+        since = last_ts + 1
+
+    if not ohlcv:
+        return pd.DataFrame(columns=["Open","High","Low","Close","Volume"])
+
+    df = pd.DataFrame(ohlcv, columns=["ts","Open","High","Low","Close","Volume"])
+    df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
+    df = df.set_index("ts").sort_index()
+    return df[["Open","High","Low","Close","Volume"]].astype(float)
+
+def _compute_weekly_indis(dfw: pd.DataFrame) -> pd.DataFrame:
+    df = dfw.copy()
+    df["MA50"] = df["Close"].rolling(window=50, min_periods=50).mean()
+    df["SMA20"] = df["Close"].rolling(window=20, min_periods=20).mean()
+    df["EMA21"] = df["Close"].ewm(span=21, adjust=False).mean()
+    df["BMSB_upper"] = df["SMA20"]
+    df["BMSB_lower"] = df["EMA21"]
+    return df
+
+def get_indicator_box_text(symbol: str = "BTC/USDT") -> str:
+    """
+    Returns a very compact single-week snapshot for overlay.
+    Example:
+      50W: 102,981 | BMSB: 110,398–113,750 | Pos: below
+    """
+    try:
+        dfw = _compute_weekly_indis(_fetch_weekly_full(symbol, since_days=4000))
+        dfl = dfw.dropna(subset=["Close"])
+        if dfl.empty:
+            return "50W: — | BMSB: — | Pos: —"
+        last = dfl.iloc[-1]
+        close = float(last["Close"])
+        ma50  = last.get("MA50")
+        up    = last.get("BMSB_upper")
+        lo    = last.get("BMSB_lower")
+
+        def f(x):
+            return "—" if pd.isna(x) else f"{float(x):,.0f}"
+
+        pos = "—"
+        if pd.notna(up) and pd.notna(lo):
+            if close > up: pos = "above"
+            elif close < lo: pos = "below"
+            else: pos = "within"
+
+        return f"50W: {f(ma50)} | BMSB: {f(lo)}–{f(up)} | Pos: {pos}"
+    except Exception:
+        return "50W: — | BMSB: — | Pos: —"
+
+# ============================ DATA & WOR LOGIC ============================
+
+def fetch_ohlcv(symbol: str = "BTC/USDT", period_days: int = 10, interval: str = "1h") -> pd.DataFrame:
+    """
+    Pull the last `period_days` of OHLCV from Binance via ccxt and return a UTC-indexed DataFrame
+    with columns: Open, High, Low, Close, Volume.
+    """
+    binance = ccxt.binance({'enableRateLimit': True})
+    tf = interval
+
+    now = datetime.now(timezone.utc)
+    since = int((now - timedelta(days=period_days)).timestamp() * 1000)
+
+    ohlcv = []
+    limit = 1000
+    while True:
+        batch = binance.fetch_ohlcv(symbol, timeframe=tf, since=since, limit=limit)
+        if not batch:
+            break
+        ohlcv.extend(batch)
+        last_ts = batch[-1][0]
+        if last_ts >= int(now.timestamp() * 1000) - 60_000:
+            break
+        since = last_ts + 1
+
     if not ohlcv:
         return pd.DataFrame()
+
+    df = pd.DataFrame(ohlcv, columns=["ts", "Open", "High", "Low", "Close", "Volume"])
+    df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
+    df = df.set_index("ts").sort_index()
+    return df[["Open", "High", "Low", "Close", "Volume"]].astype(float)
+def fetch_ohlcv_between(symbol="BTC/USDT", start: pd.Timestamp = None, end: pd.Timestamp = None, interval="1h"):
+    """
+    Fetch OHLCV between [start, end) using ccxt Binance.
+    Falls back to a modest safety window if dates are missing.
+    """
+    if start is None or end is None:
+        raise ValueError("fetch_ohlcv_between: start and end required")
+
+    binance = ccxt.binance({'enableRateLimit': True})
+    tf = interval
+    since = int(pd.Timestamp(start).tz_convert(timezone.utc).timestamp() * 1000)
+    end_ms = int(pd.Timestamp(end).tz_convert(timezone.utc).timestamp() * 1000)
+
+    ohlcv, limit = [], 1000
+    while True:
+        batch = binance.fetch_ohlcv(symbol, timeframe=tf, since=since, limit=limit)
+        if not batch:
+            break
+        ohlcv.extend(batch)
+        last_ts = batch[-1][0]
+        if last_ts >= end_ms - 60_000:
+            break
+        since = last_ts + 1
+
+    if not ohlcv:
+        return pd.DataFrame()
+
     df = pd.DataFrame(ohlcv, columns=["ts","Open","High","Low","Close","Volume"])
     df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
     df = df.set_index("ts").sort_index()
@@ -502,7 +983,8 @@ def breakout_and_extensions(df, week_start, or_high, or_low, ext_levels):
 # ============================ CHART ============================
 def plot_week_chart(df, wk, or_row, outcome: str = None):
     hi = float(or_row["OR_high"]); lo = float(or_row["OR_low"]); mid = float(or_row["OR_mid"])
-    orl_minus = lo - 2000.0
+    orl_minus = lo * (1 - 0.02)
+    orh_plus  = hi * (1 + 0.02)
 
     start = wk
     mon_close = wk + timedelta(days=1)
@@ -527,16 +1009,20 @@ def plot_week_chart(df, wk, or_row, outcome: str = None):
             ax.axvspan(day_start, min(day_end, end), color="white", alpha=0.08)
 
     ax.plot(week_df.index, week_df["Close"], lw=2.0, color="#b7f1e3", label="BTC/USDT")
+    ax.axhline(orh_plus, color="white", linestyle="-.", lw=1.2, label="ORH+")    
     ax.axhline(hi,  color="white", linestyle="--", lw=1.4, label="ORH")
     ax.axhline(mid, color="white", linestyle=":",  lw=1.2, label="ORM")
     ax.axhline(lo,  color="white", linestyle="--", lw=1.4, label="ORL")
     ax.axhline(orl_minus, color="white", linestyle="-.", lw=1.2, label="ORL-")
 
+
     xr = week_df.index[-1]
+    ax.text(xr, orh_plus, f"{orh_plus:.0f}", va="top", ha="left", fontsize=8, color="white")    
     ax.text(xr, hi,  f"{hi:.0f}",  va="bottom", ha="left", fontsize=8, color="white")
     ax.text(xr, mid, f"{mid:.0f}", va="bottom", ha="left", fontsize=8, color="white")
     ax.text(xr, lo,  f"{lo:.0f}",  va="top",    ha="left", fontsize=8, color="white")
     ax.text(xr, orl_minus, f"{orl_minus:.0f}", va="top", ha="left", fontsize=8, color="white")
+
 
     def add_rect(x0, x1, y0, y1, label, alpha=0.10):
         rect = Rectangle((x0, y0), (x1 - x0), (y1 - y0), facecolor="white", edgecolor=None, alpha=alpha, zorder=0.6)
@@ -548,6 +1034,7 @@ def plot_week_chart(df, wk, or_row, outcome: str = None):
     add_rect(tue_start, tue_end, lo,  mid, "Phase 1A", alpha=0.10)
     add_rect(tue_start, tue_end, mid, hi,  "Phase 1B", alpha=0.10)
     add_rect(wed_start, wed_end, hi, ymax, "Phase 1C", alpha=0.10)
+    add_rect(wed_start, wed_end, lo, ymin, "Phase 1D", alpha=0.10)
 
     if start <= mon_close <= end:
         ax.axvline(mon_close, color="orange", linestyle="--", lw=1.4)
@@ -563,7 +1050,49 @@ def plot_week_chart(df, wk, or_row, outcome: str = None):
     ax.legend(loc="upper left", fontsize=9, framealpha=0.25)
     ax.set_xlim(start, end); ax.set_xmargin(0)
 
-    buf = io.BytesIO(); plt.tight_layout(); plt.savefig(buf, format="png", dpi=150); plt.close(fig); buf.seek(0)
+    # === Weekly indicator box (compact overlay) ===
+    try:
+        dfw = _compute_weekly_indis(_fetch_weekly_full(SYMBOL, since_days=4000))
+        last = dfw.dropna(subset=["Close"]).iloc[-1]
+
+        def fmt_full(x):
+            return "—" if pd.isna(x) else f"{float(x):,.2f}"
+
+        ma50 = fmt_full(last.get("MA50"))
+        up   = fmt_full(last.get("BMSB_upper"))
+        lo   = fmt_full(last.get("BMSB_lower"))
+
+        pos = "—"
+        if pd.notna(last.get("BMSB_upper")) and pd.notna(last.get("BMSB_lower")):
+            c, u, l = float(last["Close"]), float(last["BMSB_upper"]), float(last["BMSB_lower"])
+            pos = "above band" if c > u else ("below band" if c < l else "within band")
+
+        text_lines = (
+            f"50W: {ma50}\n"
+            f"BMSB Upper: {up}\n"
+            f"BMSB Lower: {lo}\n"
+            f"Position: {pos}"
+        )
+
+        at = AnchoredText(
+            text_lines,
+            loc="upper right",                    # change to "lower right" if you prefer
+            prop=dict(size=9, color="white"),
+            frameon=True,
+            borderpad=0.6,
+            pad=0.4,
+        )
+        at.patch.set_boxstyle("round,pad=0.35")
+        at.patch.set_facecolor((0, 0, 0, 0.45))
+        at.patch.set_edgecolor("white")
+        at.patch.set_linewidth(0.6)
+        ax.add_artist(at)
+    except Exception as e:
+        print("indicator box error:", e)
+
+    # save
+    buf = io.BytesIO()
+    plt.tight_layout(); plt.savefig(buf, format="png", dpi=150); plt.close(fig); buf.seek(0)
     return buf.getvalue()
 
 def save_week_snapshot(df, wk, or_row, outcome_text=None) -> str:
@@ -644,6 +1173,7 @@ HELP_TEXT_SHORT = """\
 /wor chart
 /wor equity
 /wor twr
+/wor indi
 /wor help
 """
 
@@ -654,8 +1184,9 @@ HELP_TEXT = """\
 /wor alert on | off
 /wor journal [n]
 /wor stats
-/wor equity    # ΣR
-/wor twr [usd|index]  # Compounded
+/wor equity # ΣR
+/wor twr [usd|index] # Compounded
+/wor indi # Weekly 50W MA + Bull Market Support Band
 /wor export
 /wor note <text>
 /wor finalize [YYYY-MM-DD]  # auto write a completed week row (Fri close)
@@ -699,6 +1230,80 @@ def sheets_router(m):
         bot.reply_to(m, "Append OK ✅" if ok else "Append failed — see console logs.")
         return
 
+@bot.message_handler(commands=['cycle'])
+def handle_cycle(message):
+    """
+    /cycle           -> current cycle (by today's date)
+    /cycle 2016      -> show 2016–2020 cycle
+    /cycle 2020      -> show 2020–2024 cycle
+    /cycle 2024      -> show 2024–2028 cycle
+    /cycle 2028      -> show 2028–2032 cycle
+
+    Only the *current* cycle shows the 'Time Left' section.
+    All outputs push to TBI topic if configured.
+    """
+    text = (message.text or "").strip()
+    parts = text.split()
+    arg = parts[1].strip() if len(parts) > 1 else None
+
+    today = date.today()
+
+    # Map from "anchor year" → cycle index in CYCLES
+    year_to_idx = {
+        "2016": 0,
+        "2020": 1,
+        "2024": 2,
+        "2028": 3,
+    }
+
+    # --- Determine which cycle is "current" based on today ---
+    current_idx = None
+    for i, c in enumerate(CYCLES):
+        # Treat each cycle as [halving, next_halving)
+        if c["halving"] <= today < c["next_halving"]:
+            current_idx = i
+            break
+    if current_idx is None:
+        # If we're past all known next_halving dates, just use the last cycle
+        current_idx = len(CYCLES) - 1
+
+    # --- Determine which cycle to display ---
+    if arg and arg in year_to_idx:
+        idx = year_to_idx[arg]
+    else:
+        # no / invalid arg → default to current cycle
+        idx = current_idx
+
+    # Show 'time left' only for the current cycle
+    with_time = (idx == current_idx)
+
+    try:
+        reply_text = describe_cycle(idx, today=today, with_time_left=with_time)
+    except Exception as e:
+        reply_text = f"/cycle error: {e}"
+
+    # --- Prefer sending to TBI topic ---
+    if GROUP_ID and TBI_TOPIC_ID:
+        try:
+            bot.send_message(
+                GROUP_ID,
+                reply_text,
+                message_thread_id=TBI_TOPIC_ID
+            )
+        except Exception as e:
+            print("cycle → TBI_TOPIC_ID error:", e)
+            bot.reply_to(message, reply_text, **reply_kwargs_for(message))
+    else:
+        bot.reply_to(message, reply_text, **reply_kwargs_for(message))
+
+@bot.message_handler(commands=['countdown'])
+def handle_countdown(message):
+    text = build_cycle_countdown_text()
+    if GROUP_ID and TBI_TOPIC_ID:
+        post_to_tbi(text=text)
+        bot.reply_to(message, "Countdown pushed to TBI topic.", **reply_kwargs_for(message))
+    else:
+        bot.reply_to(message, text, **reply_kwargs_for(message))
 
 @bot.message_handler(commands=["start"])
 def start_cmd(m):
@@ -707,6 +1312,35 @@ def start_cmd(m):
 @bot.message_handler(commands=["ping"])
 def ping_cmd(m):
     bot.reply_to(m, "Watermelon online")
+
+def monday_of_date_str(date_s: str) -> pd.Timestamp:
+    dt = pd.to_datetime(date_s, utc=True, errors="coerce")
+    if pd.isna(dt):
+        raise ValueError("Bad date; use YYYY-MM-DD")
+    return (dt - pd.Timedelta(days=dt.weekday())).normalize()  # Monday 00:00 UTC
+
+def render_week_chart_for_date(date_s: str):
+    """
+    Returns (caption_str, png_bytes). Uses the same dark plot_week_chart().
+    """
+    wk = monday_of_date_str(date_s)
+    # Fetch 10 days around the week to be safe (Mon..next Mon + 3 days)
+    start = wk - pd.Timedelta(days=1)
+    end   = wk + pd.Timedelta(days=8)
+
+    df = fetch_ohlcv_between(SYMBOL, start=start, end=end, interval=DATA_TIMEFRAME)
+    if df.empty:
+        raise RuntimeError(f"No OHLCV data found between {start} and {end}.")
+
+    # Compute WOR for the whole span and grab this Monday
+    wor_all = compute_wor_mondayclose(df)
+    if wk not in wor_all.index:
+        raise RuntimeError(f"No Monday data for {wk.date()}.")
+
+    row = wor_all.loc[wk]
+    png = plot_week_chart(df, wk, row)
+    cap = f"{SYMBOL} — Week {wk.strftime('%Y-%m-%d')}"
+    return cap, png, wk
 
 @bot.message_handler(commands=["wor"])
 def wor_router(message):
@@ -721,7 +1355,7 @@ def wor_router(message):
     if not args:
         bot.reply_to(message, HELP_TEXT_SHORT, **reply_kwargs_for(message))
         return
-
+    
     if sub in ("help", "?"):
         bot.reply_to(message, HELP_TEXT, **reply_kwargs_for(message))
         return
@@ -1040,12 +1674,48 @@ def wor_router(message):
         bot.reply_to(message, f"Break: {sig['break']} at {tstr}\nExtensions hit: {ext_str}", **reply_kwargs_for(message)); return
 
     if sub == "chart":
+        # Case A: /wor chart YYYY-MM-DD  -> ALWAYS post to WOR Archive topic (if configured)
+        if len(args) >= 2:
+            try:
+                cap, png, wk = render_week_chart_for_date(args[1])  # your existing renderer
+            except Exception as e:
+                bot.reply_to(message, str(e), **reply_kwargs_for(message))
+                return
+
+            # Prefer archive topic; fallback to current chat
+            tid = int(WOR_ARCHIVE_TOPIC_ID) if str(WOR_ARCHIVE_TOPIC_ID).strip() else None
+            if tid is None:
+                tid = get_or_create_wor_archive_topic_id()  # optional helper; safe if you added it
+
+            if GROUP_ID and tid:
+                bot.send_photo(GROUP_ID, png, caption=cap, message_thread_id=tid)
+            else:
+                bot.send_photo(message.chat.id, png, caption=cap, **reply_kwargs_for(message))
+            return
+
+        # Case B: /wor chart  -> ALWAYS post to WOR topic (if configured)
         df = fetch_ohlcv(SYMBOL, period_days=10, interval=DATA_TIMEFRAME)
         wk, row = latest_week_or(df)
+        
         if row is None:
             bot.reply_to(message, "No data to chart.", **reply_kwargs_for(message)); return
+
         png = plot_week_chart(df, wk, row)
-        bot.send_photo(chat_id, png, **reply_kwargs_for(message)); return
+
+        tid = int(WOR_TOPIC_ID) if str(WOR_TOPIC_ID).strip() else None
+        if tid is None:
+            tid = get_or_create_wor_topic_id()  # optional helper; safe if you added it
+
+        # --- wrap raw bytes into a file-like object ---
+        fileobj = io.BytesIO(png)
+        fileobj.name = f"WOR_{wk.strftime('%Y-%m-%d')}.png"
+
+        caption = f"{SYMBOL} — Week {wk.strftime('%Y-%m-%d')}"
+        if GROUP_ID and tid:
+            bot.send_photo(GROUP_ID, fileobj, caption=caption, message_thread_id=tid)
+        else:
+            bot.send_photo(message.chat.id, fileobj, caption=caption)
+        return
 
     if sub == "alert":
         if len(args) < 2 or args[1].lower() not in ("on","off"):
@@ -1119,7 +1789,31 @@ def wor_router(message):
             cap = "WOR Compounded Equity (Index = 1.00)"
         bot.send_photo(chat_id, buf, caption=cap, **reply_kwargs_for(message))
         return
+    
+    if sub == "indi":
+        try:
+            weekly = fetch_weekly(SYMBOL, since_days=4000)
+            if weekly.empty:
+                bot.reply_to(message, "No weekly data available.", **reply_kwargs_for(message))
+                return
 
+            dfw = compute_weekly_indicators(weekly)
+            snapshot = latest_weekly_snapshot_text(dfw)
+            png = plot_weekly_indicators(dfw)
+            fileobj = io.BytesIO(png); fileobj.name = "weekly_indicators.png"
+
+            # Prefer WOR topic if configured; else reply in the current chat/thread
+            tid = int(WOR_TOPIC_ID) if str(WOR_TOPIC_ID).strip() else None
+            caption = f"{SYMBOL} — Weekly Indicators\n" + snapshot
+
+            if GROUP_ID and tid:
+                bot.send_photo(GROUP_ID, fileobj, caption=caption, message_thread_id=tid)
+            else:
+                bot.send_photo(message.chat.id, fileobj, caption=caption, **reply_kwargs_for(message))
+        except Exception as e:
+            bot.reply_to(message, f"/wor indi error: {e}", **reply_kwargs_for(message))
+        return
+   
     bot.reply_to(message, "Unknown /wor subcommand. Try /wor help", **reply_kwargs_for(message))
 
 # ============================ ALERT LOOP ============================
@@ -1219,7 +1913,12 @@ if __name__ == "__main__":
     scheduler = BackgroundScheduler()
     scheduler.add_job(check_alerts, "interval", minutes=CHECK_INTERVAL_MIN)
     scheduler.add_job(finalize_weeks, "interval", minutes=1)
+    # NEW: daily cycle countdown to TBI at 09:00 local time
+    scheduler.add_job(send_cycle_countdown, "cron", hour=9, minute=0)
     scheduler.start()
+    print("[Scheduler] Jobs:")
+    for job in scheduler.get_jobs():
+        print("  ", job)
     print("WOR BTC-only bot running…")
     try:
         bot.polling(none_stop=True)
